@@ -1,6 +1,7 @@
 ﻿Imports System.Data.SqlClient
 Imports System.Globalization
 Imports System.IO
+Imports System.Text
 Imports MySql.Data.MySqlClient
 Imports Nest
 Imports Newtonsoft.Json
@@ -183,6 +184,7 @@ Public Class EventLogProcessor
         Public MainPortID As Integer
         Public SecondPortID As Integer
         Public SessionNumber As Integer
+        Public ref_ones As String
     End Class
 
     Class ESRecord
@@ -209,6 +211,7 @@ Public Class EventLogProcessor
         Public TransactionStatus As String
         Public Transaction As Integer
         Public TransactionStartTime As Date
+        Public ref_ones As String
     End Class
 
     Public EventsList As List(Of OneEventRecord) = New List(Of OneEventRecord)
@@ -710,7 +713,7 @@ Public Class EventLogProcessor
             objConn.Open()
 
             Dim dt = New DataTable
-            For jj = 1 To 19
+            For jj = 1 To 20
                 dt.Columns.Add(New DataColumn())
             Next
 
@@ -718,7 +721,7 @@ Public Class EventLogProcessor
 
                 If Ev.AppName = Nothing Then Continue For
 
-                Dim Data(18)
+                Dim Data(19)
 
                 'Select [InfobaseCode]
                 '    ,[DateTime]
@@ -760,6 +763,7 @@ Public Class EventLogProcessor
                 Data(16) = Ev.MainPortID
                 Data(17) = Ev.SecondPortID
                 Data(18) = Ev.SessionNumber
+                Data(19) = Ev.ref_ones
 
                 Dim row As DataRow = dt.NewRow()
                 row.ItemArray = Data
@@ -768,7 +772,7 @@ Public Class EventLogProcessor
             Next
 
             Using copy As New SqlBulkCopy(objConn)
-                For jj = 0 To 18
+                For jj = 0 To 19
                     copy.ColumnMappings.Add(jj, jj)
                 Next
                 copy.DestinationTableName = "Events"
@@ -1273,8 +1277,14 @@ Public Class EventLogProcessor
             Dim Command = New System.Data.SQLite.SQLiteCommand
             Command.Connection = Conn
 
+            Dim Command_DELETE = New System.Data.SQLite.SQLiteCommand
+            Command_DELETE.Connection = Conn
+            Dim Command_DELETE_Count = 0
+
             Dim ANSI = Text.Encoding.GetEncoding(1252)
             Dim UTF8 = Text.Encoding.UTF8
+
+            Dim win1251 As Encoding = Encoding.GetEncoding(1251)
 
             While True
 
@@ -1299,11 +1309,24 @@ Public Class EventLogProcessor
                                             [dataPresentation],
                                             [workServerCode],
                                             [primaryPortCode],
-                                            [secondaryPortCode]
+                                            [secondaryPortCode],
+
+											CASE
+											    WHEN  instr(data, ':')>0 
+                                                    THEN 
+                                                        substr(data, 25 + instr(data, ':'), 8) || '-' ||
+                                                        substr(data, 21 + instr(data, ':'), 4) || '-' ||
+                                                        substr(data, 17 + instr(data, ':'), 4) || '-' || 
+                                                        substr(data, 1 + instr(data, ':'), 4)  || '-' ||
+                                                        substr(data, 5 + instr(data, ':'), 12)
+													ELSE  
+                                                         ''
+											END  as ref_ones
+
                                         FROM [EventLog] 
                                         WHERE [rowID] > @LastEventNumber83 AND [date] >= @MinimumDate
                                         ORDER BY 1
-                                        LIMIT 1000"
+                                        LIMIT 100000"
 
                 Command.Parameters.AddWithValue("LastEventNumber83", LastEventNumber83)
 
@@ -1320,7 +1343,7 @@ Public Class EventLogProcessor
                     OneEvent.Severity = rs("severity")
 
                     OneEvent.ConnectID = rs("connectID")
-                    OneEvent.DateTime = New Date().AddSeconds(Convert.ToInt64(rs("date") / 10000))
+                    OneEvent.DateTime = New Date().AddSeconds(Convert.ToInt64(rs("date") / 10000)).ToLocalTime
                     OneEvent.TransactionStatus = rs("transactionStatus")
                     OneEvent.TransactionMark = rs("transactionID")
 
@@ -1351,8 +1374,12 @@ Public Class EventLogProcessor
 
                     Dim s = ""
                     If Not String.IsNullOrEmpty(rs("data")) Then
-                        s = UTF8.GetString(ANSI.GetBytes(rs("data")))
+
+                        's = UTF8.GetString(ANSI.GetBytes(rs("data")))
+                        s = UTF8.GetString(win1251.GetBytes(rs("data")))
+
                     End If
+
                     OneEvent.DataStructure = s
 
                     OneEvent.DataType = rs("dataType")
@@ -1366,6 +1393,9 @@ Public Class EventLogProcessor
                     'OneEvent.Transaction = ""
                     OneEvent.EventType = ""
 
+                    OneEvent.ref_ones = rs("ref_ones")
+
+
                     EventsList.Add(OneEvent)
 
                     LastEventNumber83 = OneEvent.RowID
@@ -1378,19 +1408,51 @@ Public Class EventLogProcessor
                     SaveEventsToSQL()
                 End If
 
+                'Dim trans = Conn.BeginTransaction()
+
+                Command_DELETE.CommandText = "PRAGMA journal_mode = TRUNCATE; DELETE From EventLog WHERE rowID < @LastEventNumber83;"
+                Command_DELETE.Parameters.AddWithValue("LastEventNumber83", LastEventNumber83)
+
+                Try
+
+                    Command_DELETE_Count = Command_DELETE.ExecuteNonQuery()
+
+                    Log.Info("Try delete(EventLog) success: " + Command_DELETE_Count.ToString + " LastEventNumber83:" + LastEventNumber83.ToString)
+
+                Catch ex As Exception
+
+                    Log.Error(ex, "Try delete failed")
+
+                End Try
+
+                Command_DELETE.CommandText = "PRAGMA journal_mode = TRUNCATE; DELETE From EventLogMetadata WHERE eventLogID < @LastEventNumber83;"
+                Command_DELETE.Parameters.AddWithValue("LastEventNumber83", LastEventNumber83)
+
+                Try
+
+                    Command_DELETE_Count = Command_DELETE.ExecuteNonQuery()
+
+                    Log.Info("Try delete(EventLogMetadata) success: " + Command_DELETE_Count.ToString + " LastEventNumber83:" + LastEventNumber83.ToString)
+
+                Catch ex As Exception
+
+                    Log.Error(ex, "Try delete failed")
+
+                End Try
+
                 If Not HasData Then
                     Exit While
                 End If
 
             End While
 
-
+            Command_DELETE.Dispose()
             Command.Dispose()
             Conn.Close()
             Conn.Dispose()
 
         Catch ex As Exception
-            Log.Error(ex, "Error while working with EventLog table (SQLite)")
+            Log.Error(ex, "Error while working with EventLog table (SQLite):")
         End Try
 
 
@@ -1613,7 +1675,7 @@ Public Class EventLogProcessor
             OneEvent.DataStructure = ""
         ElseIf OneEvent.DataStructure.StartsWith("{") Then
             'internal representation for different objects.
-            Dim ParsedObject = ParserServices.ParseEventlogString(OneEvent.DataStructure)
+            Dim ParsedObject = ParserServices.ParseEventLogString(OneEvent.DataStructure)
             If ParsedObject.Length = 2 Then
                 If ParsedObject(0) = """S""" _
                     Or ParsedObject(0) = """R""" Then 'this is string or reference 
